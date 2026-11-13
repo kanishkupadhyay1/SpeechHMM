@@ -1,0 +1,27 @@
+{
+  "commands": [
+    "yes",
+    "no",
+    "up",
+    "down",
+    "left",
+    "right",
+    "on",
+    "off",
+    "stop",
+    "go"
+  ],
+  "n_states": 5,
+  "covariance_type": "diag",
+  "n_iter": 25,
+  "tol": 0.01,
+  "random_state": 42,
+  "extractor_config": {
+    "sample_rate": 16000,
+    "n_mfcc": 13,
+    "hop_length": 160,
+    "win_length": 400,
+    "include_deltas": true,
+    "feature_dim": 39
+  }
+}
