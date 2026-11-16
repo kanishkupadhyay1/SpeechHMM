@@ -7,54 +7,101 @@ export default function MicrophoneRecorder({ onAudioRecorded, isLoading }) {
   const [permissionError, setPermissionError] = useState(null);
   const [audioLevel, setAudioLevel] = useState(0);
 
-  const mediaRecorderRef = useRef(null);
-  const audioChunksRef = useRef([]);
-  const timerRef = useRef(null);
+  const mediaStreamRef = useRef(null);
   const audioContextRef = useRef(null);
-  const analyserRef = useRef(null);
+  const scriptProcessorRef = useRef(null);
+  const mediaSourceRef = useRef(null);
+  const recordedSamplesRef = useRef([]);
+  const timerRef = useRef(null);
   const animationFrameRef = useRef(null);
   const fileInputRef = useRef(null);
 
+  // Fallback MediaRecorder
+  const mediaRecorderRef = useRef(null);
+  const rawChunksRef = useRef([]);
+
   useEffect(() => {
     return () => {
-      if (timerRef.current) clearInterval(timerRef.current);
-      if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
-      if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
-        audioContextRef.current.close();
-      }
+      cleanupAudio();
     };
   }, []);
 
+  const cleanupAudio = () => {
+    if (timerRef.current) {
+      clearInterval(timerRef.current);
+      timerRef.current = null;
+    }
+    if (animationFrameRef.current) {
+      cancelAnimationFrame(animationFrameRef.current);
+      animationFrameRef.current = null;
+    }
+    if (scriptProcessorRef.current) {
+      try {
+        scriptProcessorRef.current.disconnect();
+      } catch (e) {}
+      scriptProcessorRef.current = null;
+    }
+    if (mediaSourceRef.current) {
+      try {
+        mediaSourceRef.current.disconnect();
+      } catch (e) {}
+      mediaSourceRef.current = null;
+    }
+    if (mediaStreamRef.current) {
+      try {
+        mediaStreamRef.current.getTracks().forEach((track) => track.stop());
+      } catch (e) {}
+      mediaStreamRef.current = null;
+    }
+    if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
+      try {
+        audioContextRef.current.close();
+      } catch (e) {}
+      audioContextRef.current = null;
+    }
+  };
+
   const startRecording = async () => {
     setPermissionError(null);
-    audioChunksRef.current = [];
+    recordedSamplesRef.current = [];
+    rawChunksRef.current = [];
 
     try {
       if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-        throw new Error('MediaDevices API is not supported in this browser.');
+        throw new Error(
+          'Microphone API is not supported or not accessible. Note: Browsers require HTTPS or localhost for microphone access.'
+        );
       }
 
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
           channelCount: 1,
-          sampleRate: 16000,
           echoCancellation: true,
           noiseSuppression: true,
+          autoGainControl: true,
         },
       });
+      mediaStreamRef.current = stream;
 
-      // Set up real-time audio level monitoring
-      const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-      const analyser = audioCtx.createAnalyser();
-      const source = audioCtx.createMediaStreamSource(stream);
-      source.connect(analyser);
-      analyser.fftSize = 256;
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      const audioCtx = new AudioCtx();
       audioContextRef.current = audioCtx;
-      analyserRef.current = analyser;
+
+      // Resume context if suspended (common in modern browser autoplay policies)
+      if (audioCtx.state === 'suspended') {
+        await audioCtx.resume();
+      }
+
+      const source = audioCtx.createMediaStreamSource(stream);
+      mediaSourceRef.current = source;
+
+      // Analyser for real-time VU meter
+      const analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 256;
+      source.connect(analyser);
 
       const bufferLength = analyser.frequencyBinCount;
       const dataArray = new Uint8Array(bufferLength);
-
       const updateMeter = () => {
         analyser.getByteFrequencyData(dataArray);
         let sum = 0;
@@ -67,40 +114,34 @@ export default function MicrophoneRecorder({ onAudioRecorded, isLoading }) {
       };
       updateMeter();
 
-      // Setup MediaRecorder
-      const options = { mimeType: 'audio/webm' };
-      let recorder;
+      // Direct PCM sampling via ScriptProcessorNode (4096 buffer size)
+      // Captures uncompressed float32 samples directly from microphone stream
+      const processor = audioCtx.createScriptProcessor(4096, 1, 1);
+      scriptProcessorRef.current = processor;
+      processor.onaudioprocess = (e) => {
+        const channelData = e.inputBuffer.getChannelData(0);
+        recordedSamplesRef.current.push(new Float32Array(channelData));
+      };
+
+      source.connect(processor);
+      // Connect to destination through a silent gain node to keep processor active
+      const silentGain = audioCtx.createGain();
+      silentGain.gain.value = 0;
+      processor.connect(silentGain);
+      silentGain.connect(audioCtx.destination);
+
+      // Concurrent MediaRecorder as secondary fallback
       try {
-        recorder = new MediaRecorder(stream, options);
-      } catch (e) {
-        recorder = new MediaRecorder(stream);
+        const recorder = new MediaRecorder(stream);
+        recorder.ondataavailable = (e) => {
+          if (e.data && e.data.size > 0) rawChunksRef.current.push(e.data);
+        };
+        mediaRecorderRef.current = recorder;
+        recorder.start(100);
+      } catch (recErr) {
+        // MediaRecorder optional; direct PCM will handle it
       }
 
-      recorder.ondataavailable = (event) => {
-        if (event.data && event.data.size > 0) {
-          audioChunksRef.current.push(event.data);
-        }
-      };
-
-      recorder.onstop = async () => {
-        if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
-        stream.getTracks().forEach((track) => track.stop());
-
-        const mime = recorder.mimeType || 'audio/webm';
-        const rawBlob = new Blob(audioChunksRef.current, { type: mime });
-
-        // Convert audio to 16kHz mono WAV for backend HMM
-        try {
-          const wavBlob = await convertToWav(rawBlob);
-          onAudioRecorded(wavBlob);
-        } catch (convErr) {
-          console.warn('WAV conversion fallback to raw blob:', convErr);
-          onAudioRecorded(rawBlob);
-        }
-      };
-
-      mediaRecorderRef.current = recorder;
-      recorder.start(100);
       setIsRecording(true);
       setRecordingDuration(0);
 
@@ -108,50 +149,107 @@ export default function MicrophoneRecorder({ onAudioRecorded, isLoading }) {
       timerRef.current = setInterval(() => {
         const elapsed = (Date.now() - startTimestamp) / 1000;
         setRecordingDuration(elapsed);
-        // Automatically stop around 1.2 seconds for isolated command recognition
         if (elapsed >= 1.5) {
           stopRecording();
         }
       }, 50);
     } catch (err) {
       console.error('Microphone error:', err);
-      setPermissionError(err.message || 'Microphone access denied or unavailable.');
+      let msg = err.message || 'Microphone access denied or unavailable.';
+      if (err.name === 'NotAllowedError') {
+        msg = 'Microphone permission was denied. Please allow microphone access in your browser settings.';
+      } else if (err.name === 'SecurityError' || (window.location.protocol === 'http:' && window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1')) {
+        msg = 'Microphone access requires HTTPS or localhost by browser security policies. Please use HTTPS or upload a WAV file.';
+      }
+      setPermissionError(msg);
       setIsRecording(false);
+      cleanupAudio();
     }
   };
 
   const stopRecording = () => {
-    if (mediaRecorderRef.current && isRecording) {
-      mediaRecorderRef.current.stop();
-      setIsRecording(false);
-      if (timerRef.current) clearInterval(timerRef.current);
+    if (!isRecording) return;
+    setIsRecording(false);
+
+    const sourceSampleRate = audioContextRef.current ? audioContextRef.current.sampleRate : 16000;
+    const pcmChunks = [...recordedSamplesRef.current];
+
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
+      try {
+        mediaRecorderRef.current.stop();
+      } catch (e) {}
     }
+
+    cleanupAudio();
+
+    // Process captured PCM audio into standard 16,000 Hz 16-bit Mono WAV
+    setTimeout(async () => {
+      try {
+        let totalSamplesCount = 0;
+        for (const chunk of pcmChunks) {
+          totalSamplesCount += chunk.length;
+        }
+
+        if (totalSamplesCount > 1000) {
+          // Merge all float32 chunks
+          const merged = new Float32Array(totalSamplesCount);
+          let offset = 0;
+          for (const chunk of pcmChunks) {
+            merged.set(chunk, offset);
+            offset += chunk.length;
+          }
+
+          // Resample to 16,000 Hz if needed
+          const resampled = resampleTo16k(merged, sourceSampleRate);
+          // Encode to standard 16-bit PCM WAV
+          const wavBlob = encodeWavFromFloat32(resampled, 16000);
+          onAudioRecorded(wavBlob);
+          return;
+        }
+
+        // Secondary fallback: if PCM was empty, attempt MediaRecorder chunks
+        if (rawChunksRef.current.length > 0) {
+          const rawBlob = new Blob(rawChunksRef.current, { type: 'audio/webm' });
+          const wavBlob = await convertBlobToWavFallback(rawBlob);
+          onAudioRecorded(wavBlob);
+          return;
+        }
+
+        throw new Error('No audio was captured. Please check your microphone and speak clearly.');
+      } catch (err) {
+        console.error('Audio processing error:', err);
+        setPermissionError(`Audio recording error: ${err.message}. Try uploading a WAV file instead.`);
+      }
+    }, 150);
   };
 
-  // Convert browser-recorded audio blob into standard 16,000 Hz Mono WAV
-  const convertToWav = async (blob) => {
-    const arrayBuffer = await blob.arrayBuffer();
-    const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
-
-    // Resample / extract channel
+  // Resample float32 array to 16,000 Hz
+  const resampleTo16k = (audioData, origSampleRate) => {
+    if (origSampleRate === 16000) return audioData;
     const targetSampleRate = 16000;
-    const offlineCtx = new OfflineAudioContext(1, Math.ceil(audioBuffer.duration * targetSampleRate), targetSampleRate);
-    const source = offlineCtx.createBufferSource();
-    source.buffer = audioBuffer;
-    source.connect(offlineCtx.destination);
-    source.start(0);
-
-    const renderedBuffer = await offlineCtx.startRendering();
-    const wavData = encodeWavPCM(renderedBuffer);
-    return new Blob([wavData], { type: 'audio/wav' });
+    const ratio = origSampleRate / targetSampleRate;
+    const newLength = Math.round(audioData.length / ratio);
+    const result = new Float32Array(newLength);
+    let offsetResult = 0;
+    let offsetBuffer = 0;
+    while (offsetResult < result.length) {
+      const nextOffsetBuffer = Math.round((offsetResult + 1) * ratio);
+      let accum = 0;
+      let count = 0;
+      for (let i = offsetBuffer; i < nextOffsetBuffer && i < audioData.length; i++) {
+        accum += audioData[i];
+        count++;
+      }
+      result[offsetResult] = count > 0 ? accum / count : 0;
+      offsetResult++;
+      offsetBuffer = nextOffsetBuffer;
+    }
+    return result;
   };
 
-  // PCM WAV encoder helper
-  const encodeWavPCM = (buffer) => {
+  // Direct 16-bit PCM WAV encoder
+  const encodeWavFromFloat32 = (samples, sampleRate = 16000) => {
     const numChannels = 1;
-    const sampleRate = buffer.sampleRate;
-    const samples = buffer.getChannelData(0);
     const byteRate = sampleRate * numChannels * 2;
     const blockAlign = numChannels * 2;
     const dataSize = samples.length * 2;
@@ -184,7 +282,18 @@ export default function MicrophoneRecorder({ onAudioRecorded, isLoading }) {
       let s = Math.max(-1, Math.min(1, samples[i]));
       view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
     }
-    return arrayBuffer;
+    return new Blob([arrayBuffer], { type: 'audio/wav' });
+  };
+
+  // Fallback converter for MediaRecorder blob
+  const convertBlobToWavFallback = async (blob) => {
+    const arrayBuffer = await blob.arrayBuffer();
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    const audioCtx = new AudioCtx();
+    const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+    const channelData = audioBuffer.getChannelData(0);
+    const resampled = resampleTo16k(channelData, audioBuffer.sampleRate);
+    return encodeWavFromFloat32(resampled, 16000);
   };
 
   const handleFileUpload = (e) => {

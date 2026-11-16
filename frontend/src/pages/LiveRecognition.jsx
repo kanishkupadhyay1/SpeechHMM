@@ -3,7 +3,7 @@ import MicrophoneRecorder from '../components/MicrophoneRecorder';
 import RecognitionResult from '../components/RecognitionResult';
 import CommandLikelihoodChart from '../components/CommandLikelihoodChart';
 import MFCCChart from '../components/MFCCChart';
-import { recognizeAudio, getMFCCData } from '../services/api';
+import { recognizeAudio, getMFCCData, getApiBase } from '../services/api';
 import { Sparkles, HelpCircle, Loader2 } from 'lucide-react';
 
 export default function LiveRecognition() {
@@ -27,7 +27,15 @@ export default function LiveRecognition() {
       setMfccData(mfccResult);
     } catch (err) {
       console.error('Recognition error:', err);
-      const detail = err.response?.data?.detail || err.message || 'Recognition request failed.';
+      let detail = err.response?.data?.detail;
+      if (!detail) {
+        if (err.message === 'Network Error' || err.code === 'ERR_NETWORK') {
+          const target = getApiBase() || window.location.origin;
+          detail = `Unable to connect to backend server at ${target}. Please verify that the backend is running and accessible from your browser.`;
+        } else {
+          detail = err.message || 'Recognition request failed.';
+        }
+      }
       setError(`Backend error: ${detail}`);
     } finally {
       setLoading(false);

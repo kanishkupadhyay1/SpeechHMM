@@ -52,17 +52,111 @@ class MFCCExtractor:
         """
         Load audio from a file path, bytes, or BytesIO buffer.
         Converts stereo to mono and resamples to target sample rate.
+        Supports standard WAV, RIFF, MP3, FLAC, OGG, and raw PCM data.
         """
+        raw_bytes = None
         if isinstance(audio_source, (bytes, bytearray)):
-            audio_source = io.BytesIO(audio_source)
+            raw_bytes = bytes(audio_source)
+            audio_buf = io.BytesIO(raw_bytes)
+        elif isinstance(audio_source, io.BytesIO):
+            audio_buf = audio_source
+            raw_bytes = audio_source.getvalue()
+        else:
+            audio_buf = audio_source
 
-        # Load with soundfile or librosa
-        try:
-            y, sr = sf.read(audio_source)
-        except Exception:
-            if isinstance(audio_source, io.BytesIO):
-                audio_source.seek(0)
-            y, sr = librosa.load(audio_source, sr=None, mono=True)
+        y = None
+        sr = self.sample_rate
+
+        # 1. Try soundfile directly on buffer
+        if isinstance(audio_buf, io.BytesIO):
+            audio_buf.seek(0)
+            try:
+                y, sr = sf.read(audio_buf)
+            except Exception:
+                y = None
+
+        # 2. If soundfile on buffer failed, try writing to a temp file for multi-decoder fallback
+        if y is None and raw_bytes is not None and len(raw_bytes) > 0:
+            import tempfile
+            tmp_path = None
+            try:
+                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                    tmp.write(raw_bytes)
+                    tmp_path = tmp.name
+
+                # Try soundfile on disk file
+                try:
+                    y, sr = sf.read(tmp_path)
+                except Exception:
+                    pass
+
+                # Try scipy.io.wavfile
+                if y is None:
+                    try:
+                        import scipy.io.wavfile as wavfile
+                        sr_scipy, data = wavfile.read(tmp_path)
+                        sr = sr_scipy
+                        if data.dtype == np.int16:
+                            y = data.astype(np.float32) / 32768.0
+                        elif data.dtype == np.int32:
+                            y = data.astype(np.float32) / 2147483648.0
+                        elif data.dtype == np.uint8:
+                            y = (data.astype(np.float32) - 128.0) / 128.0
+                        else:
+                            y = data.astype(np.float32)
+                    except Exception:
+                        pass
+
+                # Try wave standard library
+                if y is None:
+                    try:
+                        import wave
+                        with wave.open(tmp_path, 'rb') as wf:
+                            n_channels = wf.getnchannels()
+                            sampwidth = wf.getsampwidth()
+                            sr = wf.getframerate()
+                            n_frames = wf.getnframes()
+                            frames = wf.readframes(n_frames)
+                            if sampwidth == 2:
+                                data = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
+                                if n_channels > 1:
+                                    data = data.reshape(-1, n_channels)
+                                y = data
+                    except Exception:
+                        pass
+
+                # Try librosa.load
+                if y is None:
+                    try:
+                        y, sr = librosa.load(tmp_path, sr=None, mono=True)
+                    except Exception:
+                        pass
+            finally:
+                if tmp_path and os.path.exists(tmp_path):
+                    try:
+                        os.remove(tmp_path)
+                    except Exception:
+                        pass
+
+        # 3. If standard decoders failed, check if it's raw PCM 16-bit int data
+        if y is None and raw_bytes is not None and len(raw_bytes) >= 160:
+            offset = 44 if raw_bytes[:4] == b'RIFF' and len(raw_bytes) > 44 else 0
+            pcm_bytes = raw_bytes[offset:]
+            if len(pcm_bytes) % 2 != 0:
+                pcm_bytes = pcm_bytes[:-1]
+            if len(pcm_bytes) >= 320:
+                y = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+                sr = self.sample_rate
+
+        # 4. If path string was passed
+        if y is None and isinstance(audio_source, str) and os.path.isfile(audio_source):
+            try:
+                y, sr = sf.read(audio_source)
+            except Exception:
+                y, sr = librosa.load(audio_source, sr=None, mono=True)
+
+        if y is None or len(y) == 0:
+            raise ValueError("Unable to decode audio. Please submit a valid WAV audio file.")
 
         # Convert stereo to mono if necessary
         if y.ndim > 1:

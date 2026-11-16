@@ -13,7 +13,8 @@ if PROJECT_ROOT not in sys.path:
 import json
 import logging
 from typing import Dict, Any, List
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
@@ -51,9 +52,15 @@ app.add_middleware(
 service = PredictionService()
 
 # Serve static plots if available
-plots_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "results", "plots")
+plots_dir = os.path.join(PROJECT_ROOT, "results", "plots")
 if os.path.exists(plots_dir):
     app.mount("/plots", StaticFiles(directory=plots_dir), name="plots")
+
+# Serve frontend build assets if available
+dist_dir = os.path.join(PROJECT_ROOT, "frontend", "dist")
+dist_assets = os.path.join(dist_dir, "assets")
+if os.path.exists(dist_assets):
+    app.mount("/assets", StaticFiles(directory=dist_assets), name="assets")
 
 
 @app.on_event("startup")
@@ -63,9 +70,14 @@ async def startup_event():
     logger.info(f"Loaded commands: {service.commands}")
 
 
-@app.get("/", response_model=HealthResponse)
-def root_health():
-    """Health check endpoint."""
+@app.get("/")
+def root_endpoint(request: Request):
+    """Health check endpoint or frontend index depending on accept header."""
+    accept = request.headers.get("accept", "")
+    index_path = os.path.join(dist_dir, "index.html")
+    if "text/html" in accept and os.path.exists(index_path):
+        return FileResponse(index_path)
+
     return {
         "status": "healthy" if service.is_loaded else "ready_for_training",
         "message": "AI-Powered Speech Command Recognition API is operational.",
@@ -186,6 +198,23 @@ async def extract_mfcc_visualization(file: UploadFile = File(...)):
     except Exception as e:
         logger.error(f"MFCC extraction error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"MFCC extraction failed: {str(e)}")
+
+
+@app.get("/{full_path:path}")
+async def serve_spa_fallback(full_path: str):
+    """Fallback handler to serve React SPA routes when deployed."""
+    if full_path.startswith("api") or full_path.startswith("plots") or full_path.startswith("docs") or full_path.startswith("openapi.json"):
+        raise HTTPException(status_code=404, detail="Endpoint not found")
+
+    file_path = os.path.join(dist_dir, full_path)
+    if os.path.isfile(file_path):
+        return FileResponse(file_path)
+
+    index_path = os.path.join(dist_dir, "index.html")
+    if os.path.isfile(index_path):
+        return FileResponse(index_path)
+
+    raise HTTPException(status_code=404, detail="Page not found")
 
 
 if __name__ == "__main__":

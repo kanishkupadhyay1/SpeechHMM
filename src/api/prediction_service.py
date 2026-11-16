@@ -65,19 +65,43 @@ class PredictionService:
         # 2. Score all command HMMs via Forward Algorithm in log-space
         scores = score_all_commands(self.models, feat, use_custom=True)
 
-        # 3. Best command selection (argmax)
-        best_cmd = max(scores, key=scores.get)
-        best_score = float(scores[best_cmd])
+        # 3. Clean and sanitize scores for strict JSON compliance (no -inf, inf, or nan)
+        safe_scores: Dict[str, float] = {}
+        for cmd, sc in scores.items():
+            if np.isnan(sc) or sc == -np.inf or sc < -1e7:
+                safe_scores[cmd] = -1e6
+            elif sc == np.inf or sc > 1e7:
+                safe_scores[cmd] = 1e6
+            else:
+                safe_scores[cmd] = float(sc)
 
-        # 4. Viterbi decoding on winner model
+        # 4. Best command selection (argmax)
+        best_cmd = max(safe_scores, key=safe_scores.get)
+        best_score = float(safe_scores[best_cmd])
+
+        # 5. Viterbi decoding on winner model
         best_model = self.models[best_cmd]
-        viterbi_score, state_path = decode_with_hmm_model(best_model, feat, use_custom=True)
+        try:
+            viterbi_score, state_path = decode_with_hmm_model(best_model, feat, use_custom=True)
+            if isinstance(state_path, np.ndarray):
+                state_list = state_path.tolist()
+            else:
+                state_list = list(state_path)
+        except Exception:
+            state_list = [0] * len(feat)
 
-        # 5. Softmax normalization for relative confidence across supported vocabulary
-        cmd_keys = list(scores.keys())
-        raw_vals = np.array([scores[k] for k in cmd_keys], dtype=np.float64)
-        # Avoid overflow by subtracting max
-        norm_probs = softmax(raw_vals - np.max(raw_vals))
+        # 6. Softmax normalization for relative confidence across supported vocabulary
+        cmd_keys = list(safe_scores.keys())
+        raw_vals = np.array([safe_scores[k] for k in cmd_keys], dtype=np.float64)
+        if not np.all(np.isfinite(raw_vals)):
+            raw_vals = np.nan_to_num(raw_vals, nan=-1e6, neginf=-1e6, posinf=1e6)
+
+        # Safe stable softmax
+        shifted = np.clip(raw_vals - np.max(raw_vals), -500.0, 0.0)
+        norm_probs = softmax(shifted)
+        if not np.all(np.isfinite(norm_probs)):
+            norm_probs = np.full(len(cmd_keys), 1.0 / len(cmd_keys))
+
         prob_dict = {cmd_keys[i]: float(norm_probs[i]) for i in range(len(cmd_keys))}
 
         total_time_ms = (time.time() - start_time) * 1000.0
@@ -87,9 +111,9 @@ class PredictionService:
             "confidence_normalized": float(prob_dict[best_cmd]),
             "best_log_likelihood": best_score,
             "processing_time_ms": float(total_time_ms),
-            "scores": scores,
+            "scores": safe_scores,
             "normalized_probabilities": prob_dict,
-            "viterbi_state_path": state_path.tolist(),
+            "viterbi_state_path": state_list,
             "status": "success"
         }
 
@@ -97,16 +121,17 @@ class PredictionService:
         """Compute MFCC feature matrix and statistics for visualization."""
         clean_y, feat = self.extractor.process_file(audio_bytes)
         T, D = feat.shape
+        feat_clean = np.nan_to_num(feat, nan=0.0, neginf=-10.0, posinf=10.0)
         return {
-            "time_frames": T,
-            "feature_dim": D,
-            "hop_length": self.extractor.hop_length,
-            "sample_rate": self.extractor.sample_rate,
-            "mfcc_matrix": feat.tolist(),
+            "time_frames": int(T),
+            "feature_dim": int(D),
+            "hop_length": int(self.extractor.hop_length),
+            "sample_rate": int(self.extractor.sample_rate),
+            "mfcc_matrix": feat_clean.tolist(),
             "summary_statistics": {
-                "mean": float(np.mean(feat)),
-                "std": float(np.std(feat)),
-                "min": float(np.min(feat)),
-                "max": float(np.max(feat))
+                "mean": float(np.mean(feat_clean)),
+                "std": float(np.std(feat_clean)),
+                "min": float(np.min(feat_clean)),
+                "max": float(np.max(feat_clean))
             }
         }
