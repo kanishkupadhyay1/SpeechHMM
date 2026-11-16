@@ -9,7 +9,13 @@ Generates all 6 required plots in results/plots/:
 6. command_likelihood_comparison.png
 """
 
+import sys
 import os
+
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
 import glob
 from src.visualization.evaluation_plots import plot_confusion_matrix, plot_command_accuracy
 from src.visualization.mfcc_visualization import plot_waveform, plot_mfcc, plot_hmm_states
